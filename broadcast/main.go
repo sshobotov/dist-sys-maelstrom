@@ -1,142 +1,135 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"os"
+	"sync"
+	"time"
 
 	maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
+type Message int64
+type NodeID string
+
 type TopologyBody struct {
-	Topology map[string][]string `json:"topology"`
+	Topology map[NodeID][]NodeID `json:"topology"`
 }
 type BroadcastBody struct {
-	Message int64 `json:"message"`
-	MsgId   int64 `json:"msg_id"`
+	Message Message `json:"message"`
+	MsgId   int64   `json:"msg_id"`
 }
-type GossipBody struct {
-	Messages []MessageInput `json:"messages"`
+type RetryInput struct {
+	Messages []Message
+	NodeID   NodeID
 }
-type MessageInput struct {
-	Message  int64  `json:"message"`
-	OriginId string `json:"origin_id"`
+type ForwardBody struct {
+	Messages []Message `json:"messages"`
 }
 
+// 25 nodes grid -> 2 * sqrt(n) = 10 network delays
+// 100ms latency -> ~3 hops at max
+// <30 per broadcast -> ~1 message per node per broadcast request
+// rate=100 -> ~4 broadcasts per second per node
 func main() {
 	node := maelstrom.NewNode()
-	inputs := make(chan []MessageInput)
-	syncStates := make(chan struct {
-		string
-		int
+	inputs := make(chan Message)
+	retries := make(chan RetryInput)
+	attemptedRetries := make(chan RetryInput)
+	messages := []Message{}
+	toRetry := map[NodeID][]Message{}
+
+	debugLogger := log.New(os.Stderr, "DEBUG ", log.LstdFlags)
+
+	go func() {
+		for input := range inputs {
+			messages = append(messages, input)
+		}
+	}()
+	go func() {
+		for {
+			select {
+			case retry := <-retries:
+				toRetry[retry.NodeID] = append(toRetry[retry.NodeID], retry.Messages...)
+				debugLogger.Printf("Added messages to retry for %s: %v\n", retry.NodeID, retry.Messages)
+			case retry := <-attemptedRetries:
+				cleaned := []Message{}
+				removable := map[Message]struct{}{}
+				for _, message := range retry.Messages {
+					removable[message] = struct{}{}
+				}
+				for _, message := range toRetry[retry.NodeID] {
+					if _, exists := removable[message]; !exists {
+						cleaned = append(cleaned, message)
+					}
+				}
+				toRetry[retry.NodeID] = cleaned
+				debugLogger.Printf("Removed messages to retry for %s: %v\n", retry.NodeID, retry.Messages)
+			}
+		}
+	}()
+
+	node.Handle("topology", func(msg maelstrom.Message) error {
+		// Ignore topology suggestion
+		response := map[string]any{"type": "topology_ok"}
+		return node.Reply(msg, response)
 	})
-	var topology []string
-	var seenValues []int64
-	inputsApplied := map[string]struct{}{}
-	originsOfValues := map[int]string{}
-	neighborsSyncState := map[string]int{}
-
-	sync := func() {
-		for i := range topology {
-			neighbor := topology[i]
-			offset, exists := neighborsSyncState[neighbor]
-			go func() {
-				firstIndex := offset
-				if exists {
-					firstIndex = offset + 1
-				}
-				lastIndex := len(seenValues) - 1
-				var syncValues []MessageInput
-				for i := firstIndex; i <= lastIndex; i++ {
-					valueToSync := MessageInput{seenValues[i], originsOfValues[i]}
-					syncValues = append(syncValues, valueToSync)
-				}
-				if len(syncValues) < 1 {
-					return
-				}
-
-				payload := map[string]any{"type": "gossip", "messages": syncValues}
-				fmt.Fprintf(os.Stderr, "Syncing from %s to %s: %v\n", node.ID(), neighbor, payload)
-
-				err := node.RPC(neighbor, payload, func(msg maelstrom.Message) error {
-					fmt.Fprintf(os.Stderr, "Synced from %s to %s\n", node.ID(), neighbor)
-					syncStates <- struct {
-						string
-						int
-					}{neighbor, lastIndex}
-					return nil
-				})
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Failed to sync from %s to %s: %v\n", node.ID(), neighbor, err)
-				}
-			}()
-		}
-	}
-
-	go func() {
-		for entries := range inputs {
-			var hasUpdate bool
-			for i := range entries {
-				entry := entries[i]
-				if _, exists := inputsApplied[entry.OriginId]; !exists {
-					seenValues = append(seenValues, entry.Message)
-					inputsApplied[entry.OriginId] = struct{}{}
-					originsOfValues[len(seenValues)-1] = entry.OriginId
-
-					hasUpdate = true
-				}
-			}
-			if hasUpdate {
-				sync()
-			}
-		}
-	}()
-	go func() {
-		for value := range syncStates {
-			if offset := neighborsSyncState[value.string]; offset < value.int {
-				neighborsSyncState[value.string] = value.int
-			}
-		}
-	}()
-
 	node.Handle("broadcast", func(msg maelstrom.Message) error {
 		var body BroadcastBody
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
-		originId := fmt.Sprintf("%s:%d", msg.Dest, body.MsgId)
 
-		inputs <- []MessageInput{{body.Message, originId}}
+		inputs <- body.Message
+
+		// go func() {
+		// Send to other nodes
+		wg := sync.WaitGroup{}
+		ctx, cancelCtx := context.WithTimeout(context.Background(), 250*time.Millisecond)
+		for _, nodeID := range node.NodeIDs() {
+			if nodeID != node.ID() {
+				wg.Add(1)
+				go func() {
+					toRetry := toRetry[NodeID(nodeID)][:]
+					if len(toRetry) > 0 {
+						attemptedRetries <- RetryInput{toRetry, NodeID(nodeID)}
+					}
+					toForward := append(toRetry, body.Message)
+					request := map[string]any{"type": "forward", "messages": toForward}
+
+					_, err := node.SyncRPC(ctx, nodeID, request)
+					if err != nil {
+						debugLogger.Printf("Failed to sync with %s: %v\n", nodeID, err)
+						retries <- RetryInput{toForward, NodeID(nodeID)}
+					}
+					wg.Done()
+				}()
+			}
+		}
+		wg.Wait()
+		cancelCtx()
+		// }()
 
 		response := map[string]any{"type": "broadcast_ok"}
 		return node.Reply(msg, response)
 	})
-	node.Handle("gossip", func(msg maelstrom.Message) error {
-		var body GossipBody
-		if err := json.Unmarshal(msg.Body, &body); err != nil {
-			return err
-		}
-
-		inputs <- body.Messages
-
-		response := map[string]any{"type": "gossip_ok"}
-		return node.Reply(msg, response)
-	})
 	node.Handle("read", func(msg maelstrom.Message) error {
-		response := map[string]any{"type": "read_ok", "messages": seenValues}
-
+		response := map[string]any{"type": "read_ok", "messages": messages}
 		return node.Reply(msg, response)
 	})
-	node.Handle("topology", func(msg maelstrom.Message) error {
-		var body TopologyBody
+	node.Handle("forward", func(msg maelstrom.Message) error {
+		var body ForwardBody
 		if err := json.Unmarshal(msg.Body, &body); err != nil {
 			return err
 		}
-		topology = body.Topology[msg.Dest]
-		log.Printf("New known topology on %s: %v\n", msg.Dest, topology)
 
-		response := map[string]any{"type": "topology_ok"}
+		for _, message := range body.Messages {
+			inputs <- message
+		}
+
+		response := map[string]any{"type": "forward_ok"}
 		return node.Reply(msg, response)
 	})
 
