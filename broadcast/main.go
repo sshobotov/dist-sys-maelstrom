@@ -84,33 +84,33 @@ func main() {
 
 		inputs <- body.Message
 
-		// go func() {
-		// Send to other nodes
-		wg := sync.WaitGroup{}
-		ctx, cancelCtx := context.WithTimeout(context.Background(), 250*time.Millisecond)
-		for _, nodeID := range node.NodeIDs() {
-			if nodeID != node.ID() {
-				wg.Add(1)
-				go func() {
-					toRetry := toRetry[NodeID(nodeID)][:]
-					if len(toRetry) > 0 {
-						attemptedRetries <- RetryInput{toRetry, NodeID(nodeID)}
-					}
-					toForward := append(toRetry, body.Message)
-					request := map[string]any{"type": "forward", "messages": toForward}
+		go func() {
+			// Send to other nodes
+			wg := sync.WaitGroup{}
+			ctx, cancelCtx := context.WithTimeout(context.Background(), 250*time.Millisecond)
+			for _, nodeID := range node.NodeIDs() {
+				if nodeID != node.ID() {
+					wg.Add(1)
+					go func() {
+						toRetry := toRetry[NodeID(nodeID)][:]
+						if len(toRetry) > 0 {
+							attemptedRetries <- RetryInput{toRetry, NodeID(nodeID)}
+						}
+						toForward := append(toRetry, body.Message)
+						request := map[string]any{"type": "forward", "messages": toForward}
 
-					_, err := node.SyncRPC(ctx, nodeID, request)
-					if err != nil {
-						debugLogger.Printf("Failed to sync with %s: %v\n", nodeID, err)
-						retries <- RetryInput{toForward, NodeID(nodeID)}
-					}
-					wg.Done()
-				}()
+						_, err := node.SyncRPC(ctx, nodeID, request)
+						if err != nil {
+							debugLogger.Printf("Failed to sync with %s: %v\n", nodeID, err)
+							retries <- RetryInput{toForward, NodeID(nodeID)}
+						}
+						wg.Done()
+					}()
+				}
 			}
-		}
-		wg.Wait()
-		cancelCtx()
-		// }()
+			wg.Wait()
+			cancelCtx()
+		}()
 
 		response := map[string]any{"type": "broadcast_ok"}
 		return node.Reply(msg, response)
